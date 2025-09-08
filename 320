@@ -1,0 +1,736 @@
+#!/bin/bash
+
+# ========================================
+# 320 - Enhanced Web Hosting Management Script
+# ========================================
+
+# Configuration
+WEBROOT="/srv/www"
+POOLDIR="/etc/php/php-fpm.d"
+CONFIG_FILE="/usr/share/webapps/tinyfilemanager/config.php"
+
+# Quota limits (in GB)
+DISK_QUOTA_GB=5
+DB_QUOTA_GB=2
+
+# Internal quota calculations (convert GB to MB for MySQL, bytes for XFS)
+DISK_QUOTA_BYTES=$((DISK_QUOTA_GB * 1024 * 1024 * 1024))
+DB_QUOTA_MB=$((DB_QUOTA_GB * 1024))
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ========================================
+# Utility Functions
+# ========================================
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_step() {
+    echo -e "${BLUE}[STEP]${NC} $1"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+# Check if running on Arch Linux
+check_arch() {
+    if [[ ! -f /etc/arch-release ]]; then
+        log_error "This script is designed for Arch and Arch-based distributions"
+        exit 1
+    fi
+}
+
+# Check if required command exists
+check_cmd() {
+    local cmd="$1"
+    local package="${2:-$cmd}"
+    
+    if ! command -v "$cmd" &> /dev/null; then
+        log_error "$cmd is required for the script to work"
+        log_info "Install it with: pacman -S $package"
+        exit 1
+    fi
+}
+
+# Check all required dependencies
+check_dependencies() {
+    log_step "Checking dependencies..."
+    check_cmd php
+    check_cmd caddy
+    check_cmd mariadb mariadb
+    check_cmd xfs_quota xfsprogs
+    log_info "All dependencies found"
+}
+
+# ========================================
+# XFS Quota Management
+# ========================================
+
+check_xfs_quota_support() {
+    log_step "Checking XFS quota support..."
+    
+    # Check if webroot is on XFS filesystem
+    local fs_type=$(df -T "$WEBROOT" | awk 'NR==2 {print $2}')
+    if [[ "$fs_type" != "xfs" ]]; then
+        log_error "XFS quotas require $WEBROOT to be on an XFS filesystem"
+        log_info "Current filesystem: $fs_type"
+        return 1
+    fi
+    
+    # Check if quota is enabled on the filesystem
+    local mount_point=$(df "$WEBROOT" | awk 'NR==2 {print $6}')
+    if ! mount | grep "$mount_point" | grep -q "usrquota"; then
+        log_error "User quotas not enabled on $mount_point"
+        log_info "Add 'usrquota' to mount options in /etc/fstab and remount"
+        return 1
+    fi
+    
+    log_info "XFS quota support verified"
+    return 0
+}
+
+setup_user_quota() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    
+    log_step "Setting up disk quota for $sysuser..."
+    
+    # Get user ID
+    local uid=$(id -u "$sysuser" 2>/dev/null)
+    if [[ -z "$uid" ]]; then
+        log_error "Cannot get UID for user $sysuser"
+        return 1
+    fi
+    
+    # Set XFS quota
+    local mount_point=$(df "$WEBROOT" | awk 'NR==2 {print $6}')
+    if ! xfs_quota -x -c "limit bsoft=${DISK_QUOTA_BYTES} bhard=${DISK_QUOTA_BYTES} $uid" "$mount_point"; then
+        log_error "Failed to set XFS quota for user $sysuser"
+        return 1
+    fi
+    
+    log_info "Disk quota set: ${DISK_QUOTA_GB}GB for $sysuser"
+    return 0
+}
+
+remove_user_quota() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    
+    log_step "Removing disk quota for $sysuser..."
+    
+    # Get user ID
+    local uid=$(id -u "$sysuser" 2>/dev/null)
+    if [[ -n "$uid" ]]; then
+        local mount_point=$(df "$WEBROOT" | awk 'NR==2 {print $6}')
+        xfs_quota -x -c "limit bsoft=0 bhard=0 $uid" "$mount_point" 2>/dev/null
+        log_info "Disk quota removed for $sysuser"
+    fi
+}
+
+check_user_quota_usage() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    
+    local uid=$(id -u "$sysuser" 2>/dev/null)
+    if [[ -z "$uid" ]]; then
+        echo "User not found"
+        return 1
+    fi
+    
+    local mount_point=$(df "$WEBROOT" | awk 'NR==2 {print $6}')
+    local quota_info=$(xfs_quota -x -c "quota -u $uid" "$mount_point" 2>/dev/null | tail -1)
+    
+    if [[ -n "$quota_info" ]]; then
+        local used_kb=$(echo "$quota_info" | awk '{print $2}')
+        local used_mb=$((used_kb / 1024))
+        local limit_gb=$DISK_QUOTA_GB
+        echo "${used_mb}MB / ${limit_gb}GB"
+    else
+        echo "N/A"
+    fi
+}
+
+# ========================================
+# Database Quota Management
+# ========================================
+
+setup_db_quota() {
+    local db_user="$1"
+    
+    log_step "Setting up database quota for $db_user..."
+    
+    # Create quota table if it doesn't exist
+    mariadb -e "CREATE TABLE IF NOT EXISTS mysql.user_quotas (
+        user VARCHAR(64) NOT NULL,
+        host VARCHAR(64) NOT NULL,
+        quota_mb INT NOT NULL DEFAULT 0,
+        used_mb INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (user, host)
+    );" 2>/dev/null
+    
+    # Set quota for user
+    mariadb -e "INSERT INTO mysql.user_quotas (user, host, quota_mb) 
+                VALUES ('$db_user', 'localhost', $DB_QUOTA_MB) 
+                ON DUPLICATE KEY UPDATE quota_mb = $DB_QUOTA_MB;"
+    
+    log_info "Database quota set: ${DB_QUOTA_GB}GB for $db_user"
+}
+
+remove_db_quota() {
+    local db_user="$1"
+    
+    log_step "Removing database quota for $db_user..."
+    mariadb -e "DELETE FROM mysql.user_quotas WHERE user = '$db_user' AND host = 'localhost';" 2>/dev/null
+    log_info "Database quota removed for $db_user"
+}
+
+check_db_usage() {
+    local db_name="$1"
+    
+    local size_mb=$(mariadb -e "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS 'DB Size in MB' 
+                               FROM information_schema.tables 
+                               WHERE table_schema='$db_name';" -s -N 2>/dev/null)
+    
+    if [[ -n "$size_mb" && "$size_mb" != "NULL" ]]; then
+        echo "${size_mb}MB / ${DB_QUOTA_GB}GB"
+    else
+        echo "0MB / ${DB_QUOTA_GB}GB"
+    fi
+}
+
+# ========================================
+# User Management Functions
+# ========================================
+
+validate_username() {
+    local username="$1"
+
+    if [[ -z $username ]]; then
+        log_error "Username cannot be empty"
+        return 1
+    fi
+    
+    if [[ ${#username} -gt 63 ]]; then
+        log_error "Username is too long (max 63 characters)"
+        return 1
+    fi
+    
+    if [[ ! "$username" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+        log_error "Invalid characters in username"
+        log_info "Allowed: letters, digits, dots and hyphens (not at start/end)"
+        return 1
+    fi
+    
+    local reserved_names=("admin" "root" "www" "mail" "ftp" "localhost" "api" "www-data")
+    for reserved in "${reserved_names[@]}"; do
+        if [[ "$username" == "$reserved" ]]; then
+            log_error "'$username' is a reserved name"
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+generate_bcrypt() {
+    local password="$1"
+    php -r "echo password_hash('$password', PASSWORD_BCRYPT);"
+}
+
+create_linux_user() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    
+    log_step "Creating Linux user: $sysuser"
+    
+    if id "$sysuser" &>/dev/null; then
+        log_warn "Linux user $sysuser already exists"
+        return 0
+    fi
+    
+    if ! useradd --system --no-create-home --shell /usr/sbin/nologin "$sysuser"; then
+        log_error "Failed to create Linux user: $sysuser"
+        return 1
+    fi
+    
+    log_info "Created Linux user: $sysuser"
+    return 0
+}
+
+create_phpfpm_pool() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    local pool_name="${username//./_}"
+    local pool_conf="${POOLDIR}/${pool_name}.conf"
+    local user_dir="${WEBROOT}/${username}"
+    
+    log_step "Creating PHP-FPM pool: $pool_name"
+    
+    cat > "$pool_conf" <<EOF
+[${pool_name}]
+user = ${sysuser}
+group = ${sysuser}
+listen = /run/php-fpm/${pool_name}.sock
+listen.owner = caddy
+listen.group = caddy
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+chdir = /
+php_admin_value[open_basedir] = ${user_dir}:/tmp
+php_admin_value[upload_tmp_dir] = ${user_dir}/tmp
+php_admin_value[session.save_path] = ${user_dir}/tmp
+php_admin_flag[log_errors] = on
+php_admin_value[error_log] = ${user_dir}/logs/php_errors.log
+EOF
+    
+    if ! php-fpm -t; then
+        log_error "Error in PHP-FPM configuration"
+        rm -f "$pool_conf"
+        return 1
+    fi
+    
+    systemctl reload php-fpm
+    log_info "Created PHP-FPM pool: $pool_conf"
+    return 0
+}
+
+delete_phpfpm_pool() {
+    local username="$1"
+    local pool_name="${username//./_}"
+    local pool_conf="${POOLDIR}/${pool_name}.conf"
+    
+    if [[ -f "$pool_conf" ]]; then
+        rm -f "$pool_conf"
+        systemctl reload php-fpm
+        log_info "Deleted PHP-FPM pool: $pool_conf"
+    fi
+}
+
+delete_linux_user() {
+    local username="$1"
+    local sysuser="u_${username//./_}"
+    
+    if id "$sysuser" &>/dev/null; then
+        userdel "$sysuser"
+        log_info "Deleted Linux user: $sysuser"
+    fi
+}
+
+# ========================================
+# Main Operations
+# ========================================
+
+add_user() {
+    local username="$1"
+    local user_dir="${WEBROOT}/${username}"
+    local db_name="${username//./_}_db"
+    local db_user="${username//./_}_u"
+    
+    log_step "Adding user: $username"
+    
+    if ! validate_username "$username"; then
+        exit 1
+    fi
+    
+    if grep -q "'$username'" "$CONFIG_FILE" 2>/dev/null; then
+        log_error "User $username already exists"
+        exit 1
+    fi
+
+    # Generate passwords
+    local web_pass=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+    local db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+    local hashed_pass=$(generate_bcrypt "$web_pass")
+
+    # Create Linux user
+    if ! create_linux_user "$username"; then
+        exit 1
+    fi
+
+    # Setup user directory
+    log_step "Creating user directory: $user_dir"
+    mkdir -p "$user_dir"/{tmp,logs}
+    
+    if [[ -d "$WEBROOT/default" ]]; then
+        cp -r "$WEBROOT/default"/* "$user_dir"/
+    else
+        log_warn "Directory $WEBROOT/default not found"
+        echo "<?php echo 'Welcome to $username!'; ?>" > "$user_dir/index.php"
+    fi
+    
+    local sysuser="u_${username//./_}"
+    chown "$sysuser:$sysuser" -R "$user_dir"
+    chmod 755 "$user_dir"
+    chmod 750 "$user_dir"/{tmp,logs}
+
+    # Setup quota
+    if check_xfs_quota_support; then
+        if ! setup_user_quota "$username"; then
+            log_warn "Failed to set up disk quota, continuing without quota"
+        fi
+    else
+        log_warn "XFS quota not available, skipping disk quota setup"
+    fi
+
+    # Create PHP-FPM pool
+    if ! create_phpfpm_pool "$username"; then
+        log_error "Error creating PHP-FPM pool"
+        remove_user_quota "$username"
+        rm -rf "$user_dir"
+        delete_linux_user "$username"
+        exit 1
+    fi
+
+    # Update config file
+    log_step "Updating configuration file"
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    sed -i "/\$auth_users = \[/a '${username}' => '${hashed_pass}'," "$CONFIG_FILE"
+    sed -i "/\$directories_users = \[/a '${username}' => '${user_dir}'," "$CONFIG_FILE"
+
+    # Create database and user
+    log_step "Creating database: $db_name"
+    mariadb -e "CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mariadb -e "CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+    mariadb -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON \`${db_name}\`.* TO '${db_user}'@'localhost';"
+    mariadb -e "FLUSH PRIVILEGES;"
+    
+    # Setup database quota
+    setup_db_quota "$db_user"
+
+    # Display results
+    echo ""
+    echo "=================================="
+    echo -e "${GREEN}User $username created successfully!${NC}"
+    echo "=================================="
+    echo "Web login: $username"
+    echo "Web password: $web_pass"
+    echo "Domain: $username"
+    echo "Directory: $user_dir"
+    echo "System user: $sysuser"
+    echo "MariaDB database: $db_name"
+    echo "MariaDB login: $db_user"
+    echo "MariaDB password: $db_pass"
+    echo "PHP-FPM socket: /run/php-fpm/${username//./_}.sock"
+    echo "Disk quota: ${DISK_QUOTA_GB}GB"
+    echo "Database quota: ${DB_QUOTA_GB}GB"
+    echo "=================================="
+}
+
+edit_user() {
+    local username="$1"
+    local db_user="${username//./_}_u"
+    
+    log_step "Editing user: $username"
+    
+    if ! validate_username "$username"; then
+        exit 1
+    fi
+    
+    if ! grep -q "'$username'" "$CONFIG_FILE"; then
+        log_error "User $username does not exist"
+        exit 1
+    fi
+
+    # Generate new passwords
+    local new_web_pass=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+    local new_db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+    local new_hashed_pass=$(generate_bcrypt "$new_web_pass")
+
+    # Update config file
+    log_step "Updating web password"
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    sed -i "s/'$username' => '[^']*'/'$username' => '$new_hashed_pass'/g" "$CONFIG_FILE"
+
+    # Update database password
+    log_step "Updating database password"
+    mariadb -e "ALTER USER '${db_user}'@'localhost' IDENTIFIED BY '${new_db_pass}';"
+    mariadb -e "FLUSH PRIVILEGES;"
+
+    echo ""
+    echo "=================================="
+    echo -e "${GREEN}Passwords for user $username updated!${NC}"
+    echo "=================================="
+    echo "New web password: $new_web_pass"
+    echo "New DB password: $new_db_pass"
+    echo "=================================="
+}
+
+delete_user() {
+    local username="$1"
+    local user_dir="${WEBROOT}/${username}"
+    local db_name="${username//./_}_db"
+    local db_user="${username//./_}_u"
+    
+    log_step "Deleting user: $username"
+    
+    if ! validate_username "$username"; then
+        exit 1
+    fi
+    
+    echo ""
+    log_warn "Are you sure you want to delete user '$username'?"
+    log_warn "This will remove all files, database and settings!"
+    read -p "Type 'yes' to confirm: " confirmation
+    
+    if [[ "$confirmation" != "yes" ]]; then
+        log_info "Cancelled."
+        exit 0
+    fi
+
+    # Backup config
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    # Remove from config
+    log_step "Removing from configuration"
+    sed -i "/'$username' => /d" "$CONFIG_FILE"
+    
+    # Remove quotas
+    remove_user_quota "$username"
+    remove_db_quota "$db_user"
+    
+    # Remove PHP-FPM pool
+    delete_phpfpm_pool "$username"
+    
+    # Remove directory
+    if [[ -d "$user_dir" ]]; then
+        rm -rf "$user_dir"
+        log_info "Deleted directory: $user_dir"
+    fi
+    
+    # Remove database
+    log_step "Removing database: $db_name"
+    mariadb -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
+    mariadb -e "DROP USER IF EXISTS '${db_user}'@'localhost';"
+    
+    # Remove Linux user
+    delete_linux_user "$username"
+    
+    echo ""
+    echo "=================================="
+    echo -e "${GREEN}User $username deleted successfully!${NC}"
+    echo "=================================="
+}
+
+list_users() {
+    echo ""
+    echo "=================================="
+    echo "User List (Quota: ${DISK_QUOTA_GB}GB disk / ${DB_QUOTA_GB}GB database)"
+    echo "=================================="
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration file not found: $CONFIG_FILE"
+        return 1
+    fi
+    
+    local users=$(grep -oP "'\K[^']+(?=' => .+)" "$CONFIG_FILE" | sort -u)
+    
+    if [[ -z "$users" ]]; then
+        log_info "No users found."
+        return 0
+    fi
+    
+    printf "%-20s %-15s %-15s %-15s %-10s\n" "User" "Directory" "PHP-FPM" "Disk Usage" "DB Usage"
+    echo "--------------------------------------------------------------------------------"
+    
+    while IFS= read -r user; do
+        local user_dir="${WEBROOT}/${user}"
+        local pool_name="${user//./_}"
+        local db_name="${user//./_}_db"
+        local pool_status="inactive"
+        
+        # Check PHP-FPM pool status
+        if [[ -f "${POOLDIR}/${pool_name}.conf" ]]; then
+            if systemctl is-active --quiet php-fpm; then
+                pool_status="active"
+            fi
+        fi
+        
+        # Check directory status
+        local dir_status="not found"
+        if [[ -d "$user_dir" ]]; then
+            dir_status="exists"
+        fi
+        
+        # Get quota usage
+        local disk_usage=$(check_user_quota_usage "$user")
+        local db_usage=$(check_db_usage "$db_name")
+        
+        printf "%-20s %-15s %-15s %-15s %-10s\n" "$user" "$dir_status" "$pool_status" "$disk_usage" "$db_usage"
+    done <<< "$users"
+    
+    echo "=================================="
+}
+
+check_system() {
+    echo ""
+    echo "=================================="
+    echo "System Status Check"
+    echo "=================================="
+    
+    local status=0
+    
+    # Check configuration file
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration file not found: $CONFIG_FILE"
+        status=1
+    else
+        log_info "Configuration file: OK"
+    fi
+    
+    # Check PHP-FPM
+    if ! systemctl is-active --quiet php-fpm; then
+        log_warn "PHP-FPM is not running"
+        status=1
+    else
+        log_info "PHP-FPM service: OK"
+    fi
+    
+    # Check MariaDB
+    if ! systemctl is-active --quiet mariadb; then
+        log_error "MariaDB is not running"
+        status=1
+    else
+        log_info "MariaDB service: OK"
+    fi
+    
+    # Check directories
+    if [[ ! -w "$WEBROOT" ]]; then
+        log_error "No write permission to $WEBROOT"
+        status=1
+    else
+        log_info "Webroot writable: OK"
+    fi
+    
+    if [[ ! -w "$POOLDIR" ]]; then
+        log_error "No write permission to $POOLDIR"
+        status=1
+    else
+        log_info "Pool directory writable: OK"
+    fi
+    
+    # Check XFS quota support
+    if check_xfs_quota_support; then
+        log_info "XFS quota support: OK"
+    else
+        log_warn "XFS quota support: Not available"
+    fi
+    
+    # Display quota settings
+    echo ""
+    echo "Quota Settings:"
+    echo "  Disk quota per user: ${DISK_QUOTA_GB}GB"
+    echo "  Database quota per user: ${DB_QUOTA_GB}GB"
+    
+    if [[ $status -eq 0 ]]; then
+        echo ""
+        log_info "System status: All checks passed"
+    else
+        echo ""
+        log_error "System status: Issues found"
+    fi
+    
+    echo "=================================="
+    return $status
+}
+
+show_usage() {
+    echo ""
+    echo "320 - Enhanced Web Hosting Management Script"
+    echo "============================================="
+    echo ""
+    echo "Usage: $0 {add|edit|del|list|check} [domain/user]"
+    echo ""
+    echo "Commands:"
+    echo "  add <domain>     - Create new user with quotas"
+    echo "  edit <domain>    - Regenerate user passwords"
+    echo "  del <domain>     - Delete user and all data"
+    echo "  list             - Show all users with usage"
+    echo "  check            - Check system status"
+    echo ""
+    echo "Current Quota Limits:"
+    echo "  Disk: ${DISK_QUOTA_GB}GB per user"
+    echo "  Database: ${DB_QUOTA_GB}GB per user"
+    echo ""
+    echo "Examples:"
+    echo "  $0 add example.com"
+    echo "  $0 edit mysite.ru"
+    echo "  $0 del testuser"
+    echo "  $0 list"
+    echo "  $0 check"
+    echo ""
+}
+
+# ========================================
+# Main Script Logic
+# ========================================
+
+# Pre-flight checks
+check_root
+check_arch
+check_dependencies
+
+# Command handling
+case "$1" in
+    add)
+        if [[ -z "$2" ]]; then
+            show_usage
+            exit 1
+        fi
+        if ! check_system; then
+            log_error "System check failed. Please fix the issues above before deleting users."
+            exit 1
+        fi
+        add_user "$2"
+        ;;
+    edit)
+        if [[ -z "$2" ]]; then
+            show_usage
+            exit 1
+        fi
+        check_system >/dev/null || exit 1
+        edit_user "$2"
+        ;;
+    del|delete)
+        if [[ -z "$2" ]]; then
+            show_usage
+            exit 1
+        fi
+        check_system >/dev/null || exit 1
+        delete_user "$2"
+        ;;
+    list)
+        list_users
+        ;;
+    check)
+        check_system
+        ;;
+    *)
+        show_usage
+        exit 1
+        ;;
+esac
