@@ -305,6 +305,7 @@ php_admin_value[upload_tmp_dir] = ${user_dir}/tmp
 php_admin_value[session.save_path] = ${user_dir}/tmp
 php_admin_flag[log_errors] = on
 php_admin_value[error_log] = ${user_dir}/logs/php_errors.log
+php_admin_value[disable_functions] = exec, shell_exec, system, passthru, popen, proc_open, eval, assert, phpinfo
 EOF
     
     if ! php-fpm -t; then
