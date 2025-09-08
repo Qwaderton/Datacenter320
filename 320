@@ -8,6 +8,7 @@
 WEBROOT="/srv/www"
 POOLDIR="/etc/php/php-fpm.d"
 CONFIG_FILE="/usr/share/webapps/tinyfilemanager/config.php"
+BACKUP_DIR="/backups"  # Default backup directory
 
 # Quota limits (in GB)
 DISK_QUOTA_GB=5
@@ -80,6 +81,211 @@ check_dependencies() {
     check_cmd mariadb mariadb
     check_cmd xfs_quota xfsprogs
     log_info "All dependencies found"
+}
+
+# ========================================
+# Backup and Restore Functions
+# ========================================
+
+backup_user() {
+    local username="$1"
+    local user_dir="${WEBROOT}/${username}"
+    local db_name="${username//./_}_db"
+    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/${username}_${backup_timestamp}.tar.gz"
+    
+    log_step "Creating backup for user: $username"
+    
+    if ! validate_username "$username"; then
+        exit 1
+    fi
+    
+    if [[ ! -d "$user_dir" ]]; then
+        log_error "User directory $user_dir does not exist"
+        exit 1
+    fi
+    
+    # Create backup directory if it doesn't exist
+    mkdir -p "$BACKUP_DIR"
+    
+    # Create temporary directory for backup
+    local temp_dir=$(mktemp -d)
+    
+    # Backup user files
+    log_step "Backing up user files"
+    cp -a "$user_dir" "$temp_dir/files"
+    
+    # Backup configuration (web password)
+    log_step "Backing up configuration"
+    local web_password_hash=$(grep -A1 "'$username'" "$CONFIG_FILE" | grep -o "'.*'" | tr -d "'")
+    echo "$web_password_hash" > "$temp_dir/web_password.hash"
+    
+    # Backup database schema and data
+    log_step "Backing up database"
+    local db_user="${username//./_}_u"
+    local db_password=$(mariadb -e "SELECT authentication_string FROM mysql.user WHERE User='$db_user' AND Host='localhost'" -s -N 2>/dev/null)
+    
+    if [[ -n "$db_password" ]]; then
+        echo "$db_password" > "$temp_dir/db_password.hash"
+    fi
+    
+    # Dump database schema and data
+    mysqldump "$db_name" > "$temp_dir/database.sql" 2>/dev/null
+    
+    if [[ $? -ne 0 ]]; then
+        log_warn "Could not backup database $db_name (might not exist)"
+        rm -f "$temp_dir/database.sql"
+    fi
+    
+    # Create backup archive
+    log_step "Creating backup archive"
+    tar -czf "$backup_file" -C "$temp_dir" .
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    log_info "Backup created: $backup_file"
+    echo "Backup contents:"
+    echo "  - User files: $user_dir"
+    echo "  - Web password hash"
+    echo "  - Database schema and data: $db_name"
+    echo "  - Backup file: $backup_file"
+}
+
+restore_user() {
+    local backup_file="$1"
+    local new_username="$2"
+    local new_user_dir="${WEBROOT}/${new_username}"
+    local new_db_name="${new_username//./_}_db"
+    local new_db_user="${new_username//./_}_u"
+    
+    log_step "Restoring backup to new user: $new_username"
+    
+    if ! validate_username "$new_username"; then
+        exit 1
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        log_error "Backup file $backup_file does not exist"
+        exit 1
+    fi
+    
+    if grep -q "'$new_username'" "$CONFIG_FILE" 2>/dev/null; then
+        log_error "User $new_username already exists"
+        exit 1
+    fi
+    
+    # Create temporary directory for extraction
+    local temp_dir=$(mktemp -d)
+    
+    # Extract backup
+    log_step "Extracting backup"
+    tar -xzf "$backup_file" -C "$temp_dir"
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to extract backup file"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Create new user (similar to add_user but with restored credentials)
+    log_step "Creating new user: $new_username"
+    
+    # Generate new database password (we'll use the restored one if available)
+    local db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+    local web_password_hash=$(cat "$temp_dir/web_password.hash" 2>/dev/null)
+    
+    # If we have a restored web password hash, use it
+    if [[ -z "$web_password_hash" ]]; then
+        local web_pass=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+        web_password_hash=$(generate_bcrypt "$web_pass")
+    fi
+    
+    # Create Linux user
+    if ! create_linux_user "$new_username"; then
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Setup user directory
+    log_step "Creating user directory: $new_user_dir"
+    mkdir -p "$new_user_dir"
+    
+    # Copy backed up files
+    if [[ -d "$temp_dir/files" ]]; then
+        cp -a "$temp_dir/files/"* "$new_user_dir/"
+    fi
+    
+    local sysuser="u_${new_username//./_}"
+    chown "$sysuser:$sysuser" -R "$new_user_dir"
+    chmod 755 "$new_user_dir"
+    
+    # Setup quota
+    if check_xfs_quota_support; then
+        if ! setup_user_quota "$new_username"; then
+            log_warn "Failed to set up disk quota, continuing without quota"
+        fi
+    else
+        log_warn "XFS quota not available, skipping disk quota setup"
+    fi
+    
+    # Create PHP-FPM pool
+    if ! create_phpfpm_pool "$new_username"; then
+        log_error "Error creating PHP-FPM pool"
+        remove_user_quota "$new_username"
+        rm -rf "$new_user_dir"
+        delete_linux_user "$new_username"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Update config file
+    log_step "Updating configuration file"
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    sed -i "/\$auth_users = \[/a '${new_username}' => '${web_password_hash}'," "$CONFIG_FILE"
+    sed -i "/\$directories_users = \[/a '${new_username}' => '${new_user_dir}'," "$CONFIG_FILE"
+    
+    # Create database and user
+    log_step "Creating database: $new_db_name"
+    mariadb -e "CREATE DATABASE \`${new_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mariadb -e "CREATE USER '${new_db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+    mariadb -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON \`${new_db_name}\`.* TO '${new_db_user}'@'localhost';"
+    mariadb -e "FLUSH PRIVILEGES;"
+    
+    # Setup database quota
+    setup_db_quota "$new_db_user"
+    
+    # Restore database data if available
+    if [[ -f "$temp_dir/database.sql" ]]; then
+        log_step "Restoring database data"
+        mariadb "$new_db_name" < "$temp_dir/database.sql"
+    fi
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    # Display results
+    echo ""
+    echo "=================================="
+    echo -e "${GREEN}User $new_username restored successfully!${NC}"
+    echo "=================================="
+    echo "Web login: $new_username"
+    if [[ -n "$web_pass" ]]; then
+        echo "Web password: $web_pass (new)"
+    else
+        echo "Web password: (restored from backup)"
+    fi
+    echo "Domain: $new_username"
+    echo "Directory: $new_user_dir"
+    echo "System user: $sysuser"
+    echo "MariaDB database: $new_db_name"
+    echo "MariaDB login: $new_db_user"
+    echo "MariaDB password: $db_pass (new)"
+    echo "PHP-FPM socket: /run/php-fpm/${new_username//./_}.sock"
+    echo "Disk quota: ${DISK_QUOTA_GB}GB"
+    echo "Database quota: ${DB_QUOTA_GB}GB"
+    echo "=================================="
 }
 
 # ========================================
@@ -664,14 +870,16 @@ show_usage() {
     echo "320 - Enhanced Web Hosting Management Script"
     echo "============================================="
     echo ""
-    echo "Usage: $0 {add|edit|del|list|check} [domain/user]"
+    echo "Usage: $0 {add|edit|del|list|check|backup|restore} [domain/user] [backup_file]"
     echo ""
     echo "Commands:"
-    echo "  add <domain>     - Create new user with quotas"
-    echo "  edit <domain>    - Regenerate user passwords"
-    echo "  del <domain>     - Delete user and all data"
-    echo "  list             - Show all users with usage"
-    echo "  check            - Check system status"
+    echo "  add <domain>        - Create new user with quotas"
+    echo "  edit <domain>       - Regenerate user passwords"
+    echo "  del <domain>        - Delete user and all data"
+    echo "  list                - Show all users with usage"
+    echo "  check               - Check system status"
+    echo "  backup <domain>     - Backup user files, config and database"
+    echo "  restore <backup_file> <new_domain> - Restore backup to new user"
     echo ""
     echo "Current Quota Limits:"
     echo "  Disk: ${DISK_QUOTA_GB}GB per user"
@@ -683,6 +891,8 @@ show_usage() {
     echo "  $0 del testuser"
     echo "  $0 list"
     echo "  $0 check"
+    echo "  $0 backup example.com"
+    echo "  $0 restore /backups/example.com_20231201_120000.tar.gz newsite.com"
     echo ""
 }
 
@@ -729,6 +939,22 @@ case "$1" in
         ;;
     check)
         check_system
+        ;;
+    backup)
+        if [[ -z "$2" ]]; then
+            show_usage
+            exit 1
+        fi
+        check_system >/dev/null || exit 1
+        backup_user "$2"
+        ;;
+    restore)
+        if [[ -z "$2" || -z "$3" ]]; then
+            show_usage
+            exit 1
+        fi
+        check_system >/dev/null || exit 1
+        restore_user "$2" "$3"
         ;;
     *)
         show_usage
