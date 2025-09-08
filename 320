@@ -563,8 +563,9 @@ create_user_infrastructure() {
     fi
     
     chown "$sysuser:$sysuser" -R "$user_dir"
-    chmod 755 "$user_dir"
-    chmod 750 "$user_dir"/{tmp,logs}
+    chgrp -R caddy "$user_dir"
+    chmod 770 "$user_dir"
+    chmod 770 "$user_dir"/{tmp,logs}
 
     # Setup quota
     if check_xfs_quota_support; then
