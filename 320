@@ -120,14 +120,15 @@ backup_user() {
     local web_password_hash=$(grep -A1 "'$username'" "$CONFIG_FILE" | grep -o "'.*'" | tr -d "'")
     echo "$web_password_hash" > "$temp_dir/web_password.hash"
     
-    # Backup database schema and data
-    log_step "Backing up database"
-    local db_user="${username//./_}_u"
-    local db_password=$(mariadb -e "SELECT authentication_string FROM mysql.user WHERE User='$db_user' AND Host='localhost'" -s -N 2>/dev/null)
-    
-    if [[ -n "$db_password" ]]; then
-        echo "$db_password" > "$temp_dir/db_password.hash"
-    fi
+    # Backup database password hash and plugin
+	log_step "Backing up database password"
+	local db_user="${username//./_}_u"
+	local db_password_hash=$(mariadb -e "SELECT IFNULL(NULLIF(authentication_string, ''), Password) FROM mysql.user WHERE User='$db_user' AND Host='localhost'" -s -N 2>/dev/null)
+	local db_plugin=$(mariadb -e "SELECT plugin FROM mysql.user WHERE User='$db_user' AND Host='localhost'" -s -N 2>/dev/null)
+
+	if [[ -n "$db_password_hash" ]]; then
+		echo "$db_password_hash $db_plugin" > "$temp_dir/db_password.hash"
+	fi
     
     # Dump database schema and data
     mysqldump "$db_name" > "$temp_dir/database.sql" 2>/dev/null
@@ -148,6 +149,7 @@ backup_user() {
     echo "Backup contents:"
     echo "  - User files: $user_dir"
     echo "  - Web password hash"
+    echo "  - Database password hash and plugin"
     echo "  - Database schema and data: $db_name"
     echo "  - Backup file: $backup_file"
 }
@@ -188,68 +190,52 @@ restore_user() {
         exit 1
     fi
     
-    # Create new user (similar to add_user but with restored credentials)
-    log_step "Creating new user: $new_username"
-    
-    # Generate new database password (we'll use the restored one if available)
-    local db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+    # Get credentials from backup
     local web_password_hash=$(cat "$temp_dir/web_password.hash" 2>/dev/null)
+    local db_hash=""
+    local db_plugin=""
     
-    # If we have a restored web password hash, use it
+    # Parse database password hash and plugin
+    if [[ -f "$temp_dir/db_password.hash" ]]; then
+        local db_password_info=$(cat "$temp_dir/db_password.hash")
+        db_hash=$(echo "$db_password_info" | cut -d' ' -f1)
+        db_plugin=$(echo "$db_password_info" | cut -d' ' -f2-)
+    fi
+    
+    # If we don't have a restored web password hash, generate a new one
     if [[ -z "$web_password_hash" ]]; then
         local web_pass=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
         web_password_hash=$(generate_bcrypt "$web_pass")
     fi
     
-    # Create Linux user
-    if ! create_linux_user "$new_username"; then
+    # Create user infrastructure (common function)
+    if ! create_user_infrastructure "$new_username" "$web_password_hash"; then
         rm -rf "$temp_dir"
         exit 1
     fi
-    
-    # Setup user directory
-    log_step "Creating user directory: $new_user_dir"
-    mkdir -p "$new_user_dir"
     
     # Copy backed up files
     if [[ -d "$temp_dir/files" ]]; then
         cp -a "$temp_dir/files/"* "$new_user_dir/"
     fi
     
-    local sysuser="u_${new_username//./_}"
-    chown "$sysuser:$sysuser" -R "$new_user_dir"
-    chmod 755 "$new_user_dir"
-    
-    # Setup quota
-    if check_xfs_quota_support; then
-        if ! setup_user_quota "$new_username"; then
-            log_warn "Failed to set up disk quota, continuing without quota"
-        fi
-    else
-        log_warn "XFS quota not available, skipping disk quota setup"
-    fi
-    
-    # Create PHP-FPM pool
-    if ! create_phpfpm_pool "$new_username"; then
-        log_error "Error creating PHP-FPM pool"
-        remove_user_quota "$new_username"
-        rm -rf "$new_user_dir"
-        delete_linux_user "$new_username"
-        rm -rf "$temp_dir"
-        exit 1
-    fi
-    
-    # Update config file
-    log_step "Updating configuration file"
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-    
-    sed -i "/\$auth_users = \[/a '${new_username}' => '${web_password_hash}'," "$CONFIG_FILE"
-    sed -i "/\$directories_users = \[/a '${new_username}' => '${new_user_dir}'," "$CONFIG_FILE"
-    
-    # Create database and user
+    # Create database and user with restored credentials if available
     log_step "Creating database: $new_db_name"
     mariadb -e "CREATE DATABASE \`${new_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    mariadb -e "CREATE USER '${new_db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+    
+    if [[ -n "$db_hash" && -n "$db_plugin" ]]; then
+        # Use restored database credentials
+        if [[ "$db_plugin" == "mysql_native_password" ]]; then
+            mariadb -e "CREATE USER '${new_db_user}'@'localhost' IDENTIFIED WITH mysql_native_password AS '${db_hash}';"
+        else
+            mariadb -e "CREATE USER '${new_db_user}'@'localhost' IDENTIFIED VIA $db_plugin USING PASSWORD('$db_hash');"
+        fi
+    else
+        # Generate new database password
+        local db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+        mariadb -e "CREATE USER '${new_db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+    fi
+    
     mariadb -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON \`${new_db_name}\`.* TO '${new_db_user}'@'localhost';"
     mariadb -e "FLUSH PRIVILEGES;"
     
@@ -278,10 +264,14 @@ restore_user() {
     fi
     echo "Domain: $new_username"
     echo "Directory: $new_user_dir"
-    echo "System user: $sysuser"
+    echo "System user: u_${new_username//./_}"
     echo "MariaDB database: $new_db_name"
     echo "MariaDB login: $new_db_user"
-    echo "MariaDB password: $db_pass (new)"
+    if [[ -n "$db_pass" ]]; then
+        echo "MariaDB password: $db_pass (new)"
+    else
+        echo "MariaDB password: (restored from backup)"
+    fi
     echo "PHP-FPM socket: /run/php-fpm/${new_username//./_}.sock"
     echo "Disk quota: ${DISK_QUOTA_GB}GB"
     echo "Database quota: ${DB_QUOTA_GB}GB"
@@ -547,6 +537,63 @@ delete_linux_user() {
     fi
 }
 
+# Common function to create user infrastructure
+create_user_infrastructure() {
+    local username="$1"
+    local web_password_hash="$2"
+    local user_dir="${WEBROOT}/${username}"
+    local sysuser="u_${username//./_}"
+    
+    log_step "Creating user infrastructure for: $username"
+    
+    # Create Linux user
+    if ! create_linux_user "$username"; then
+        return 1
+    fi
+    
+    # Setup user directory
+    log_step "Creating user directory: $user_dir"
+    mkdir -p "$user_dir"/{tmp,logs}
+    
+    if [[ -d "$WEBROOT/default" ]]; then
+        cp -r "$WEBROOT/default"/* "$user_dir"/
+    else
+        log_warn "Directory $WEBROOT/default not found"
+        echo "<?php echo 'Welcome to $username!'; ?>" > "$user_dir/index.php"
+    fi
+    
+    chown "$sysuser:$sysuser" -R "$user_dir"
+    chmod 755 "$user_dir"
+    chmod 750 "$user_dir"/{tmp,logs}
+
+    # Setup quota
+    if check_xfs_quota_support; then
+        if ! setup_user_quota "$username"; then
+            log_warn "Failed to set up disk quota, continuing without quota"
+        fi
+    else
+        log_warn "XFS quota not available, skipping disk quota setup"
+    fi
+
+    # Create PHP-FPM pool
+    if ! create_phpfpm_pool "$username"; then
+        log_error "Error creating PHP-FPM pool"
+        remove_user_quota "$username"
+        rm -rf "$user_dir"
+        delete_linux_user "$username"
+        return 1
+    fi
+
+    # Update config file
+    log_step "Updating configuration file"
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    sed -i "/\$auth_users = \[/a '${username}' => '${web_password_hash}'," "$CONFIG_FILE"
+    sed -i "/\$directories_users = \[/a '${username}' => '${user_dir}'," "$CONFIG_FILE"
+    
+    return 0
+}
+
 # ========================================
 # Main Operations
 # ========================================
@@ -573,51 +620,10 @@ add_user() {
     local db_pass=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
     local hashed_pass=$(generate_bcrypt "$web_pass")
 
-    # Create Linux user
-    if ! create_linux_user "$username"; then
+    # Create user infrastructure
+    if ! create_user_infrastructure "$username" "$hashed_pass"; then
         exit 1
     fi
-
-    # Setup user directory
-    log_step "Creating user directory: $user_dir"
-    mkdir -p "$user_dir"/{tmp,logs}
-    
-    if [[ -d "$WEBROOT/default" ]]; then
-        cp -r "$WEBROOT/default"/* "$user_dir"/
-    else
-        log_warn "Directory $WEBROOT/default not found"
-        echo "<?php echo 'Welcome to $username!'; ?>" > "$user_dir/index.php"
-    fi
-    
-    local sysuser="u_${username//./_}"
-    chown "$sysuser:$sysuser" -R "$user_dir"
-    chmod 755 "$user_dir"
-    chmod 750 "$user_dir"/{tmp,logs}
-
-    # Setup quota
-    if check_xfs_quota_support; then
-        if ! setup_user_quota "$username"; then
-            log_warn "Failed to set up disk quota, continuing without quota"
-        fi
-    else
-        log_warn "XFS quota not available, skipping disk quota setup"
-    fi
-
-    # Create PHP-FPM pool
-    if ! create_phpfpm_pool "$username"; then
-        log_error "Error creating PHP-FPM pool"
-        remove_user_quota "$username"
-        rm -rf "$user_dir"
-        delete_linux_user "$username"
-        exit 1
-    fi
-
-    # Update config file
-    log_step "Updating configuration file"
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-
-    sed -i "/\$auth_users = \[/a '${username}' => '${hashed_pass}'," "$CONFIG_FILE"
-    sed -i "/\$directories_users = \[/a '${username}' => '${user_dir}'," "$CONFIG_FILE"
 
     # Create database and user
     log_step "Creating database: $db_name"
@@ -638,7 +644,7 @@ add_user() {
     echo "Web password: $web_pass"
     echo "Domain: $username"
     echo "Directory: $user_dir"
-    echo "System user: $sysuser"
+    echo "System user: u_${username//./_}"
     echo "MariaDB database: $db_name"
     echo "MariaDB login: $db_user"
     echo "MariaDB password: $db_pass"
