@@ -562,8 +562,7 @@ create_user_infrastructure() {
         echo "<?php echo 'Welcome to $username!'; ?>" > "$user_dir/index.php"
     fi
     
-    chown "$sysuser:$sysuser" -R "$user_dir"
-    chgrp -R caddy "$user_dir"
+    chown "caddy:caddy" -R "$user_dir"
     chmod 770 "$user_dir"
     chmod 770 "$user_dir"/{tmp,logs}
 
